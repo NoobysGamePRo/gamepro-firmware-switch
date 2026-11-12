@@ -1,5 +1,21 @@
-// GamePRo Switch Sketch v1.5
+// GamePRo Switch Sketch v1.6
 // Special thanks to Westini who helped tidy the original sketch.
+//
+// Changes from v1.5:
+//   - Joystick in any direction and at any strength: 'J' + 4 bytes
+//     (angle low byte, angle high byte, magnitude 0-100 %, duration in
+//     10 ms units; duration 0 = hold, magnitude 0 = centre). Angle 0 = up,
+//     90 = right (clockwise). Up/Down/Left/Right are 0/90/180/270 at 100 %.
+//     Each axis is scaled to its own calibrated limits, so partial pushes
+//     follow the calibration even if a servo's travel is not symmetric.
+//   - No more jams when changing a held direction (e.g. hold Up, then hold
+//     Right): the stick now glides both servos together from the held
+//     position to the new one, instead of snapping one axis home while the
+//     other pushes out. A press after a hold waits for the stick to centre.
+//   - 'V' returns the firmware version line (no ACK), so the app can tell
+//     whether 'J' is supported before sending it.
+//   - 'i' (set bearing for 'r' / '9') no longer repeats the previous
+//     command. 'r' / '9' keep their behaviour (default bearing 0 = up).
 //
 // Changes from v1.4:
 //   - releaseAll() is now called at the start of EVERY command (D-pad
@@ -59,9 +75,16 @@
 #define WONDER_TRADE         'W'
 #define NE_Hold              '9'
 #define NE_TAP               'r'
+#define STICK                'J'   // + angle(2 bytes LE), magnitude(0-100), duration(x10 ms, 0 = hold)
+#define VERSION_QUERY        'V'   // replies FW_VERSION + \n (no ACK)
 #define ACK                  'K'   // sent back to Python when a command is complete
 #define READ_CALIBRATION     'q'   // sends calibration CSV + \n (no ACK)
 #define WRITE_CALIBRATION    'w'   // receives calibration CSV, saves to EEPROM, sends ACK
+
+#define FW_VERSION      "GamePRo Switch 1.6"
+#define GLIDE_STEP_DEG  2     // servo degrees per glide step when changing a held direction
+#define GLIDE_STEP_MS   6     // ms per glide step
+#define STICK_SETTLE_MS 150   // time for the stick to return to centre before a new press
 
 // ── EEPROM calibration ────────────────────────────────────────────────────────
 #define EEPROM_MAGIC 0xA7
@@ -134,6 +157,10 @@ byte pinSR = 6;   // myservo_5 — Soft Reset / Home / +
 double theta  = 0;
 int    bearing = 0;
 int    letter  = 0;
+
+// Where the two joystick servos were last sent (they are the D-pad servos)
+int stickX = 90;
+int stickY = 90;
 
 
 // ── EEPROM helpers ────────────────────────────────────────────────────────────
@@ -208,6 +235,8 @@ void setup()
   myservo_3.write(AYOff);
   myservo_4.write(BXOff);
   myservo_5.write(SROff);
+  stickX = leftrightOff;
+  stickY = updownOff;
 }
 
 
@@ -223,6 +252,7 @@ void loop()
       int receivedInt;
       Serial.readBytes((char*)&receivedInt, sizeof(receivedInt));
       bearing = receivedInt;
+      letter = 0;   // v1.6: only sets the bearing (v1.5 re-ran the previous command)
     }
     else {
       letter = int(type);
@@ -302,6 +332,7 @@ void loop()
             // Reattach servos to updated pins and move to resting positions
             myservo_1.detach(); myservo_1.attach(pinLR); myservo_1.write(leftrightOff);
             myservo_2.detach(); myservo_2.attach(pinUD); myservo_2.write(updownOff);
+            stickX = leftrightOff; stickY = updownOff;
             myservo_3.detach(); myservo_3.attach(pinAY); myservo_3.write(AYOff);
             myservo_4.detach(); myservo_4.attach(pinBX); myservo_4.write(BXOff);
             myservo_5.detach(); myservo_5.attach(pinSR); myservo_5.write(SROff);
@@ -314,58 +345,66 @@ void loop()
 
       // ── D-pad hold ─────────────────────────────────────────────────────
       case HOLD_UP:
-        releaseAll();
-        myservo_2.write(upMax);
+        releaseButtons();
+        stickGlide(leftrightOff, upMax);
         delay(prePress);
         myservo_2.write(upMax - arrowBackoffU);
+        stickY = upMax - arrowBackoffU;
         Serial.write(ACK);
         break;
       case HOLD_DOWN:
-        releaseAll();
-        myservo_2.write(downMax);
+        releaseButtons();
+        stickGlide(leftrightOff, downMax);
         delay(prePress);
         myservo_2.write(downMax + arrowBackoffD);
+        stickY = downMax + arrowBackoffD;
         Serial.write(ACK);
         break;
       case HOLD_LEFT:
-        releaseAll();
-        myservo_1.write(leftMax);
+        releaseButtons();
+        stickGlide(leftMax, updownOff);
         delay(prePress);
         myservo_1.write(leftMax + arrowBackoffL);
+        stickX = leftMax + arrowBackoffL;
         Serial.write(ACK);
         break;
       case HOLD_RIGHT:
-        releaseAll();
-        myservo_1.write(rightMax);
+        releaseButtons();
+        stickGlide(rightMax, updownOff);
         delay(prePress);
         myservo_1.write(rightMax - arrowBackoffR);
+        stickX = rightMax - arrowBackoffR;
         Serial.write(ACK);
         break;
 
       // ── D-pad press and release ────────────────────────────────────────
       case PRESS_UP:
-        releaseAll();
+        releaseButtons();
+        stickCentre(true);
         myservo_2.write(upMax);
         delay(arrow_releaseU);
         myservo_2.write(updownOff);
         Serial.write(ACK);
         break;
       case PRESS_DOWN:
-        releaseAll();
+        releaseButtons();
+        stickCentre(true);
         myservo_2.write(downMax);
         delay(arrow_releaseD);
         myservo_2.write(updownOff);
         Serial.write(ACK);
         break;
       case PRESS_LEFT:
-        releaseAll();
+        releaseButtons();
+        stickCentre(true);
         myservo_1.write(leftMax);
         delay(arrow_releaseL);
         myservo_1.write(leftrightOff);
         Serial.write(ACK);
         break;
       case PRESS_RIGHT:
-        releaseAll();
+        releaseButtons();
+        stickCentre(true);
         myservo_1.write(rightMax);
         delay(arrow_releaseR);
         myservo_1.write(leftrightOff);
@@ -374,22 +413,44 @@ void loop()
 
       // ── NE joystick (diagonal) ─────────────────────────────────────────
       case NE_TAP:
-        releaseAll();
-        theta = bearing * PI / 180;
-        myservo_1.write((rightMax - leftMax) / 2 * sin(theta) + leftrightOff);
-        myservo_2.write(updownOff - (downMax - upMax) / 2 * cos(theta));
+        releaseButtons();
+        stickCentre(true);
+        stickMove(bearing, 100);
         delay(70);
-        myservo_2.write(updownOff);
-        myservo_1.write(leftrightOff);
+        stickCentre(false);
         Serial.write(ACK);
         break;
 
       case NE_Hold:
-        releaseAll();
-        theta = bearing * PI / 180;
-        myservo_1.write((rightMax - leftMax) / 2 * sin(theta) + leftrightOff);
-        myservo_2.write(updownOff - (downMax - upMax) / 2 * cos(theta));
+        releaseButtons();
+        stickMove(bearing, 100);
         Serial.write(ACK);
+        break;
+
+      // ── Joystick: any angle, any strength (v1.6) ─────────────────────────
+      case STICK: {
+        byte b[4];
+        if (Serial.readBytes(b, 4) == 4) {
+          int angle = b[0] | (b[1] << 8);
+          int mag   = constrain(b[2], 0, 100);
+          releaseButtons();
+          if (mag == 0) {
+            stickCentre(false);
+          } else {
+            stickMove(angle, mag);        // glides if a direction is already held
+            if (b[3] > 0) {               // tap: hold for the duration, then centre
+              delay(b[3] * 10);
+              stickCentre(false);
+            }
+          }
+        }
+        Serial.write(ACK);
+        break;
+      }
+
+      // ── Version (v1.6) ───────────────────────────────────────────────────
+      case VERSION_QUERY:
+        Serial.println(FW_VERSION);
         break;
 
       // ── Face buttons ───────────────────────────────────────────────────
@@ -463,10 +524,65 @@ void loop()
 }
 
 
-void releaseAll() {
-  myservo_1.write(leftrightOff);
-  myservo_2.write(updownOff);
+void releaseButtons() {
   myservo_3.write(AYOff);
   myservo_4.write(BXOff);
   myservo_5.write(SROff);
+}
+
+void releaseAll() {
+  releaseButtons();
+  stickCentre(false);
+}
+
+
+// ── Joystick helpers (v1.6) ───────────────────────────────────────────────────
+
+bool stickHeld() {
+  return stickX != leftrightOff || stickY != updownOff;
+}
+
+// Centre the stick. settle = wait for it to get there before the next move.
+void stickCentre(bool settle) {
+  bool wasHeld = stickHeld();
+  myservo_1.write(leftrightOff);
+  myservo_2.write(updownOff);
+  stickX = leftrightOff;
+  stickY = updownOff;
+  if (settle && wasHeld) delay(STICK_SETTLE_MS);
+}
+
+// One axis: v in -1..1, positive towards posMax; each side scaled to its own limit
+int axisPos(float v, int posMax, int negMax, int off) {
+  if (v >= 0) return off + (int)round(v * (posMax - off));
+  return off + (int)round(-v * (negMax - off));
+}
+
+// Move from wherever the stick is to (tx, ty). From a held position both
+// servos move together in small steps (a straight line stays inside the
+// stick's circle), so one axis never pushes out while the other is still
+// holding the stick - the v1.5 jam.
+void stickGlide(int tx, int ty) {
+  int dx = tx - stickX;
+  int dy = ty - stickY;
+  int steps = max(abs(dx), abs(dy)) / GLIDE_STEP_DEG;
+  if (stickHeld()) {
+    for (int i = 1; i < steps; i++) {
+      myservo_1.write(stickX + (int)((long)dx * i / steps));
+      myservo_2.write(stickY + (int)((long)dy * i / steps));
+      delay(GLIDE_STEP_MS);
+    }
+  }
+  myservo_1.write(tx);
+  myservo_2.write(ty);
+  stickX = tx;
+  stickY = ty;
+}
+
+// angle: 0 = up, 90 = right (clockwise); mag: 0-100 %
+void stickMove(int angle, int mag) {
+  float t = angle * PI / 180.0;
+  float m = mag / 100.0;
+  stickGlide(axisPos(m * sin(t), rightMax, leftMax, leftrightOff),
+             axisPos(m * cos(t), upMax, downMax, updownOff));
 }
